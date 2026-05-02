@@ -1,0 +1,143 @@
+name: Build Kernel (Docker/LXC)
+
+on:
+  push:
+    branches:
+      - main
+      - 'claude/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      compiler:
+        description: 'Compiler to use'
+        required: false
+        default: 'zyc'
+        type: choice
+        options:
+          - zyc
+          - aosp
+
+env:
+  KERNEL_DEFCONFIG: capybara_defconfig
+  ARCH: arm64
+  SUBARCH: arm64
+  CLANG_DIR: ${{ github.workspace }}/toolchains/clang
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev zip wget \
+            python3 perl make gcc binutils cpio rsync kmod
+
+      - name: Select compiler
+        id: compiler
+        run: |
+          INPUT="${{ github.event.inputs.compiler }}"
+          COMPILER="${INPUT:-zyc}"
+          echo "name=$COMPILER" >> "$GITHUB_OUTPUT"
+          if [ "$COMPILER" = "aosp" ]; then
+            echo "url=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android15-release/clang-r510928.tar.gz" >> "$GITHUB_OUTPUT"
+            echo "cache_key=clang-aosp-r510928" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=https://github.com/ZyCromerZ/Clang/releases/download/23.0.0git-20260130-release/Clang-23.0.0git-20260130.tar.gz" >> "$GITHUB_OUTPUT"
+            echo "cache_key=clang-zyc-23.0-20260130" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLANG_DIR }}
+          key: ${{ steps.compiler.outputs.cache_key }}
+
+      - name: Download and extract Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$CLANG_DIR"
+          wget -q --show-progress -O /tmp/clang.tar.gz "${{ steps.compiler.outputs.url }}"
+          tar -xf /tmp/clang.tar.gz -C "$CLANG_DIR"
+          rm /tmp/clang.tar.gz
+
+      - name: Verify Clang installation
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          clang --version
+
+      - name: Apply defconfig
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          make O=out CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG
+
+      - name: Merge Docker/LXC config fragment
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          scripts/kconfig/merge_config.sh -m -O out \
+            out/.config arch/arm64/configs/docker_lxc.fragment
+          make O=out CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" olddefconfig
+
+      - name: Verify container-required configs
+        run: |
+          for opt in CONFIG_PID_NS CONFIG_NET_NS CONFIG_IPC_NS CONFIG_UTS_NS \
+                     CONFIG_USER_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER \
+                     CONFIG_CGROUP_PIDS CONFIG_CGROUP_DEVICE CONFIG_OVERLAY_FS \
+                     CONFIG_BRIDGE_NETFILTER CONFIG_FHANDLE; do
+            val=$(grep "^${opt}=" out/.config || true)
+            if [ -z "$val" ]; then
+              echo "MISSING: $opt"
+              exit 1
+            fi
+            echo "OK: $val"
+          done
+
+      - name: Build kernel
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          make -j$(nproc) O=out CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
+
+      - name: Package AnyKernel zip
+        run: |
+          TIME=$(date "+%Y%m%d-%H%M%S")
+          ZIP_NAME="Capybara-GKI-${TIME}.zip"
+          BOOT_DIR="out/arch/arm64/boot"
+          TEMP_DIR="anykernel_temp"
+
+          cp -r anykernel "$TEMP_DIR"
+
+          if [ -f "$BOOT_DIR/Image.gz-dtb" ]; then
+            cp "$BOOT_DIR/Image.gz-dtb" "$TEMP_DIR/"
+          elif [ -f "$BOOT_DIR/Image.gz" ]; then
+            cp "$BOOT_DIR/Image.gz" "$TEMP_DIR/"
+          elif [ -f "$BOOT_DIR/Image" ]; then
+            cp "$BOOT_DIR/Image" "$TEMP_DIR/"
+          else
+            echo "Error: No kernel image found in $BOOT_DIR"
+            ls "$BOOT_DIR"
+            exit 1
+          fi
+
+          (cd "$TEMP_DIR" && zip -r9 "../$ZIP_NAME" ./*)
+          rm -rf "$TEMP_DIR"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+          if-no-files-found: error
