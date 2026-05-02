@@ -67,6 +67,16 @@ export SUBARCH=arm64
 
 # Build kernel
 make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG || exit 1
+
+# Merge Docker/LXC config fragment if present
+DOCKER_LXC_FRAGMENT="$KERNEL_DIR/arch/arm64/configs/docker_lxc.fragment"
+if [ -f "$DOCKER_LXC_FRAGMENT" ]; then
+    echo "Merging Docker/LXC config fragment..."
+    "$KERNEL_DIR/scripts/kconfig/merge_config.sh" -m -O "$OUT_DIR" \
+        "$OUT_DIR/.config" "$DOCKER_LXC_FRAGMENT" || exit 1
+    make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" olddefconfig || exit 1
+fi
+
 make -j17 O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" || exit 1
 
 # Clean up old kernel zip files
